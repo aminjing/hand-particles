@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D手势粒子系统</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', Roboto, sans-serif; }
+        
+        /* 引导页覆盖层 */
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 100; color: white; backdrop-filter: blur(10px);
+            transition: opacity 0.5s;
+        }
+        #start-btn {
+            padding: 15px 40px; font-size: 1.2rem;
+            background: linear-gradient(45deg, #ff3366, #ff6b6b);
+            border: none; border-radius: 30px; color: white; cursor: pointer;
+            box-shadow: 0 4px 15px rgba(255, 51, 102, 0.4);
+            transition: transform 0.2s;
+        }
+        #start-btn:hover { transform: scale(1.05); }
+        .tips { margin-top: 20px; font-size: 0.9rem; color: #aaa; }
+
+        /* 主容器 */
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        
+        /* 小窗口预览 */
+        #video-preview {
+            position: absolute; bottom: 20px; left: 20px;
+            width: 120px; height: 90px; border-radius: 8px;
+            transform: scaleX(-1); opacity: 0.5; z-index: 2;
+            border: 1px solid rgba(255,255,255,0.2); pointer-events: none;
+            display: none; /* 初始隐藏 */
+        }
+    </style>
+    
+    <!-- 引入 Three.js 和相关库 -->
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/",
+                "lil-gui": "https://unpkg.com/lil-gui@0.18.0/dist/lil-gui.esm.min.js"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <!-- 引导页 -->
+    <div id="start-screen">
+        <h1>✨ 3D手势交互粒子</h1>
+        <p>需要摄像头权限以捕捉手势</p>
+        <button id="start-btn">开启体验</button>
+        <div class="tips">请确保光线充足，露出手掌与手指</div>
+    </div>
+
+    <video id="video-preview" playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import GUI from 'lil-gui';
+
+        let scene, camera, renderer, particles, material, geometry;
+        let controls;
+        let time = 0;
+        const PARTICLE_COUNT = 12000;
+        
+        const state = {
+            shape: 'heart', color: '#00ffff', size: 3.5,
+            dispersion: 0.0, scale: 1.0, autoRotate: true
+        };
+        const handData = { pinchDistance: 0, isPresent: false };
+
+        // --- 初始化入口 ---
+        document.getElementById('start-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('start-btn');
+            btn.innerText = "正在启动...";
+            btn.disabled = true;
+
+            try {
+                await setupMediaPipe(); // 先尝试启动摄像头
+                initThree();            // 成功后再渲染3D
+                
+                // 隐藏引导页
+                document.getElementById('start-screen').style.opacity = 0;
+                setTimeout(() => {
+                    document.getElementById('start-screen').style.display = 'none';
+                    document.getElementById('video-preview').style.display = 'block';
+                }, 500);
+            } catch (e) {
+                btn.innerText = "启动失败";
+                alert("无法访问摄像头。请检查权限，或确保使用HTTPS/本地服务器运行。");
+                console.error(e);
+            }
+        });
+
+        // --- Three.js 逻辑 ---
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x050505, 0.02);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.z = 30;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.autoRotate = state.autoRotate;
+
+            initParticles();
+            initUI();
+            
+            window.addEventListener('resize', onWindowResize);
+            animate();
+        }
+
+        function initParticles() {
+            if(particles) scene.remove(particles);
+            geometry = new THREE.BufferGeometry();
+            updateGeometryShape(state.shape);
+
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uColor: { value: new THREE.Color(state.color) },
+                    uSize: { value: state.size * renderer.getPixelRatio() },
+                    uDispersion: { value: 0.0 },
+                    uGlobalScale: { value: 1.0 }
+                },
+                vertexShader: `
+                    uniform float uTime; uniform float uSize;
+                    uniform float uDispersion; uniform float uGlobalScale;
+                    attribute vec3 aRandom;
+                    varying float vAlpha;
+                    void main() {
+                        vec3 pos = position;
+                        pos += aRandom * uDispersion * 20.0; // 扩散逻辑
+                        pos *= uGlobalScale;
+                        pos *= 1.0 + sin(uTime * 1.5 + pos.y * 0.2) * 0.03; // 呼吸
+                        vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                        gl_Position = projectionMatrix * mvPosition;
+                        gl_PointSize = uSize * (30.0 / -mvPosition.z);
+                        vAlpha = 1.0 - smoothstep(10.0, 60.0, length(mvPosition.xyz));
+                    }
+                `,
+                fragmentShader: `
+                    uniform vec3 uColor; varying float vAlpha;
+                    void main() {
+                        float dist = length(gl_PointCoord - 0.5);
+                        if (dist > 0.5) discard;
+                        gl_FragColor = vec4(uColor, (0.5 - dist) * 2.0 * vAlpha);
+                    }
+                `,
+                transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+            });
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        function updateGeometryShape(type) {
+            const positions = [], randomness = [];
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let x, y, z;
+                if (type === 'heart') {
+                    const phi = Math.random() * Math.PI * 2, theta = Math.random() * Math.PI;
+                    x = 16 * Math.pow(Math.sin(phi), 3);
+                    y = 13 * Math.cos(phi) - 5 * Math.cos(2*phi) - 2 * Math.cos(3*phi) - Math.cos(4*phi);
+                    z = (Math.random()-0.5) * 6;
+                    x *= 0.5; y *= 0.5;
+                } else if (type === 'flower') {
+                     const r = Math.sqrt(i) * 0.2, a = i * 0.1;
+                     x = Math.cos(a) * r; y = Math.sin(a) * r; z = Math.sin(r)*2;
+                } else { // Cube default
+                    const s = 12; 
+                    x = (Math.random()-0.5)*s; y = (Math.random()-0.5)*s; z = (Math.random()-0.5)*s;
+                }
+                positions.push(x, y, z);
+                randomness.push(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5);
+            }
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('aRandom', new THREE.Float32BufferAttribute(randomness, 3));
+        }
+
+        // --- 摄像头与AI ---
+        function setupMediaPipe() {
+            return new Promise((resolve, reject) => {
+                const videoElement = document.getElementById('video-preview');
+                const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+                hands.setOptions({ maxNumHands: 1, minDetectionConfidence: 0.5 });
+                
+                hands.onResults(results => {
+                    if (results.multiHandLandmarks.length > 0) {
+                        handData.isPresent = true;
+                        const lm = results.multiHandLandmarks[0];
+                        // 简单的拇指-食指距离计算
+                        const d = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+                        handData.pinchDistance = d;
+                    } else {
+                        handData.isPresent = false;
+                    }
+                });
+
+                const cameraUtils = new Camera(videoElement, {
+                    onFrame: async () => await hands.send({image: videoElement}),
+                    width: 640, height: 480
+                });
+                cameraUtils.start().then(resolve).catch(reject);
+            });
+        }
+
+        // --- 循环 ---
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.01;
+            
+            // 交互平滑处理
+            if (material) {
+                material.uniforms.uTime.value = time;
+                let targetDisp = 0, targetScale = 1.0;
+                
+                if (handData.isPresent) {
+                    // 捏合距离: 0.02(闭合) ~ 0.2(张开)
+                    targetScale = THREE.MathUtils.mapLinear(handData.pinchDistance, 0.02, 0.2, 0.5, 2.0);
+                    targetScale = THREE.MathUtils.clamp(targetScale, 0.5, 2.5);
+                    // 如果张得很大，触发扩散
+                    if (handData.pinchDistance > 0.18) targetDisp = (handData.pinchDistance - 0.18) * 8.0;
+                }
+                
+                state.dispersion += (targetDisp - state.dispersion) * 0.1;
+                state.scale += (targetScale - state.scale) * 0.1;
+                
+                material.uniforms.uDispersion.value = state.dispersion;
+                material.uniforms.uGlobalScale.value = state.scale;
+            }
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function initUI() {
+            const gui = new GUI({ title: '控制台' });
+            gui.add(state, 'shape', ['heart', 'flower', 'cube']).name('形状').onChange(updateGeometryShape);
+            gui.addColor(state, 'color').name('颜色').onChange(v => material.uniforms.uColor.value.set(v));
+            gui.add(state, 'autoRotate').name('自动旋转').onChange(v => controls.autoRotate = v);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+    </script>
+</body>
+</html>
